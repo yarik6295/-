@@ -1,0 +1,5 @@
+streamlit
+sentence-transformers
+chromadb
+rank_bm25
+requests
