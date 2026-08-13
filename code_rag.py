@@ -1,29 +1,6 @@
-"""
-Handler Locator — локальный поиск МЕСТА в коде, где определён конкретный
-обработчик/функция/маршрут/стиль, полностью на вашем компьютере, без
-платных API.
-
-Стек:
-  - rank_bm25                — лексический поиск (без ML, легковесный)
-  - sentence-transformers     — эмбеддинги с поддержкой русского языка
-  - ChromaDB (in-memory)      — векторная база данных
-  - Ollama                    — локальная LLM для подтверждения находки
-  - Streamlit                 — графический интерфейс в браузере
-
-Установка:
-    pip install streamlit sentence-transformers chromadb requests rank_bm25
-
-Ollama (опционально, для объяснений находок):
-    1. Скачать: https://ollama.com/download
-    2. В терминале: ollama pull qwen2.5-coder
-    3. Ollama сама поднимает локальный сервер на http://localhost:11434
-
-Запуск:
-    streamlit run code_rag.py
-"""
-
 from __future__ import annotations
 
+import ast
 import json
 import re
 import subprocess
@@ -54,10 +31,7 @@ except ImportError:
     st.stop()
 
 
-# ============================================================================
-# Конфигурация
-# ============================================================================
-
+# какие файлы вообще парсим - можно расширить при желании
 CODE_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".html", ".css"}
 
 EXCLUDED_DIRS = {
@@ -65,13 +39,14 @@ EXCLUDED_DIRS = {
     "dist", "build", ".idea", ".vscode", "target", "env",
 }
 
-MAX_SYMBOL_LINES = 60      # сколько строк тела символа сохраняем максимум
-MAX_SYMBOL_CHARS = 2500    # и сколько символов текста максимум
+# ограничения, чтобы не пихать в промпт модели гигантские куски кода
+MAX_SYMBOL_LINES = 60
+MAX_SYMBOL_CHARS = 2500
 
 EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
-DEFAULT_TOP_K = 8          # сколько финальных кандидатов уходит в LLM
-CANDIDATE_POOL_SIZE = 25   # сколько кандидатов берём из КАЖДОГО из двух поисков перед слиянием
-RRF_K = 60                 # константа Reciprocal Rank Fusion (стандартное значение)
+DEFAULT_TOP_K = 8
+CANDIDATE_POOL_SIZE = 25
+RRF_K = 60
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_CHAT_URL = f"{OLLAMA_BASE_URL}/api/chat"
@@ -84,26 +59,18 @@ PREFERRED_MODELS = [
     "codellama", "codellama:latest",
 ]
 
-# Ключевые слова языков, которые regex для "метод-шортхенд" (`name(...) {`)
-# не должен принимать за имя обработчика/функции.
 JS_CONTROL_KEYWORDS = {
     "if", "for", "while", "switch", "catch", "function", "return",
     "else", "try", "do", "with",
 }
 
 
-# ============================================================================
-# Модель данных
-# ============================================================================
-
 @dataclass
 class CodeSymbol:
-    """Один найденный в коде символ: функция, метод, класс, роут,
-    обработчик события или CSS-правило — с ТОЧНЫМИ границами в файле."""
     id: str
     file_path: str
     name: str
-    kind: str          # function | method | class | route | listener | handler-ref | element(<tag>) | inline-handler | style
+    kind: str
     signature: str
     start_line: int
     end_line: int
@@ -115,22 +82,14 @@ class CodeSymbol:
 
     @property
     def searchable_text(self) -> str:
-        """Текст, который уходит и в BM25, и в эмбеддинги: имя важнее всего,
-        поэтому оно повторяется, дальше сигнатура и превью тела."""
         return f"{self.kind} {self.name} {self.name}\n{self.signature}\n{self.text[:400]}"
 
 
 class AnalysisError(Exception):
-    """Сбой самого запроса к Ollama (сеть, парсинг JSON и т.п.) —
-    не путать с тем, что модель честно не нашла подходящего символа."""
+    pass
 
-
-# ============================================================================
-# Шаг 1: сканирование проекта
-# ============================================================================
 
 def collect_source_files(root: Path) -> list[Path]:
-    """Рекурсивно находит файлы с кодом, пропуская служебные папки."""
     return [
         path for path in root.rglob("*")
         if path.is_file()
@@ -140,7 +99,6 @@ def collect_source_files(root: Path) -> list[Path]:
 
 
 def read_file_safely(path: Path) -> str | None:
-    """Устойчивое к битым кодировкам и правам доступа чтение файла."""
     try:
         return path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
@@ -152,12 +110,8 @@ def read_file_safely(path: Path) -> str | None:
         return None
 
 
-# ============================================================================
-# Шаг 2: разбор символов (функции / методы / классы / обработчики / роуты)
-# ============================================================================
-
 def find_indented_block_end(lines: list[str], start_idx: int, indent: int) -> int:
-    """Для Python: конец блока — первая непустая строка с отступом <= indent."""
+    # идём вниз, пока отступ не станет меньше или равен исходному
     end = start_idx
     for j in range(start_idx + 1, min(len(lines), start_idx + 400)):
         line = lines[j]
@@ -171,8 +125,6 @@ def find_indented_block_end(lines: list[str], start_idx: int, indent: int) -> in
 
 
 def find_brace_block_end(lines: list[str], start_idx: int) -> int:
-    """Для C-подобного синтаксиса: конец блока — строка, где счётчик
-    фигурных скобок впервые возвращается к нулю после открытия."""
     depth = 0
     opened = False
     for j in range(start_idx, min(len(lines), start_idx + 400)):
@@ -184,10 +136,10 @@ def find_brace_block_end(lines: list[str], start_idx: int) -> int:
     return min(start_idx + 30, len(lines) - 1)
 
 
-RawSymbol = tuple[str, str, int, int, str]  # name, kind, start_line(1-idx), end_line(1-idx), signature
+RawSymbol = tuple[str, str, int, int, str]
 
 
-def _extract_python(lines: list[str]) -> list[RawSymbol]:
+def _extract_python_regex_fallback(lines: list[str]) -> list[RawSymbol]:
     results: list[RawSymbol] = []
     decorators: list[str] = []
     for i, raw_line in enumerate(lines):
@@ -206,6 +158,52 @@ def _extract_python(lines: list[str]) -> list[RawSymbol]:
             end = find_indented_block_end(lines, i, indent)
             results.append((name, kind, i + 1, end + 1, stripped))
         decorators = []
+    return results
+
+
+_ROUTE_DECORATOR_RE = re.compile(r"\.(route|get|post|put|delete|patch)\(")
+
+
+def _extract_python(lines: list[str], source: str) -> list[RawSymbol]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return _extract_python_regex_fallback(lines)
+
+    results: list[RawSymbol] = []
+
+    def decorator_sources(node: ast.AST) -> list[str]:
+        sources = []
+        for dec in getattr(node, "decorator_list", []):
+            segment = ast.get_source_segment(source, dec)
+            if segment:
+                sources.append(segment)
+        return sources
+
+    def signature_line(node: ast.AST) -> str:
+        idx = node.lineno - 1
+        return lines[idx].strip() if 0 <= idx < len(lines) else getattr(node, "name", "")
+
+    def visit(node: ast.AST, in_class: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                decs = decorator_sources(child)
+                kind = "method" if in_class else "function"
+                if any(_ROUTE_DECORATOR_RE.search(d) for d in decs):
+                    kind = "route"
+                start = child.lineno
+                end = getattr(child, "end_lineno", start)
+                results.append((child.name, kind, start, end, signature_line(child)))
+                visit(child, in_class=False)
+            elif isinstance(child, ast.ClassDef):
+                start = child.lineno
+                end = getattr(child, "end_lineno", start)
+                results.append((child.name, "class", start, end, signature_line(child)))
+                visit(child, in_class=True)
+            else:
+                visit(child, in_class)
+
+    visit(tree, in_class=False)
     return results
 
 
@@ -286,14 +284,6 @@ _SCRIPT_SRC = re.compile(r"<script\b[^>]*\bsrc=", re.IGNORECASE)
 
 
 def _extract_html(lines: list[str]) -> list[RawSymbol]:
-    """
-    HTML часто содержит не только разметку, но и весь JS целиком внутри
-    <script>...</script> (типичная однофайловая веб-страница). Если
-    сканировать только теги, вся логика приложения (функции,
-    addEventListener, обработчики) остаётся невидимой. Поэтому здесь
-    отдельно вырезаются JS-блоки и прогоняются через тот же JS-парсер,
-    а найденные строки пересчитываются в номера строк исходного файла.
-    """
     results: list[RawSymbol] = []
     in_script = False
     script_start_idx = 0
@@ -303,8 +293,6 @@ def _extract_html(lines: list[str]) -> list[RawSymbol]:
         if not script_lines:
             return
         for name, kind, s_start, s_end, sig in _extract_js(script_lines):
-            # s_start/s_end — 1-индексные номера СТРОК ВНУТРИ блока скрипта;
-            # переводим их в номера строк исходного HTML-файла.
             results.append((name, kind, script_start_idx + s_start, script_start_idx + s_end, sig))
 
     for i, line in enumerate(lines):
@@ -317,9 +305,8 @@ def _extract_html(lines: list[str]) -> list[RawSymbol]:
 
             if _SCRIPT_OPEN.search(line) and not _SCRIPT_SRC.search(line):
                 in_script = True
-                script_start_idx = i + 1  # тело скрипта начинается со следующей строки
+                script_start_idx = i + 1
                 script_lines = []
-                # <script>код на той же строке — редкий случай, но подхватим
                 after = _SCRIPT_OPEN.split(line, maxsplit=1)[-1]
                 if _SCRIPT_CLOSE.search(after):
                     in_script = False
@@ -336,7 +323,7 @@ def _extract_html(lines: list[str]) -> list[RawSymbol]:
             else:
                 script_lines.append(line)
 
-    if in_script:  # незакрытый <script> до конца файла — на всякий случай разбираем то, что есть
+    if in_script:
         flush_script()
 
     return results
@@ -359,7 +346,6 @@ def _extract_css(lines: list[str]) -> list[RawSymbol]:
 
 
 _EXTRACTORS = {
-    ".py": _extract_python,
     ".js": _extract_js, ".ts": _extract_js, ".jsx": _extract_js, ".tsx": _extract_js,
     ".go": _extract_go,
     ".rs": _extract_rust,
@@ -369,15 +355,19 @@ _EXTRACTORS = {
 
 
 def extract_symbols_from_file(relative_path: str, content: str) -> list[CodeSymbol]:
-    """Прогоняет файл через regex-разбор под его расширение и превращает
-    сырые совпадения в CodeSymbol с точными границами и обрезанным текстом."""
-    extractor = _EXTRACTORS.get(Path(relative_path).suffix)
-    if extractor is None:
-        return []
-
+    ext = Path(relative_path).suffix
     lines = content.splitlines()
+
+    if ext == ".py":
+        raw = _extract_python(lines, content)
+    else:
+        extractor = _EXTRACTORS.get(ext)
+        if extractor is None:
+            return []
+        raw = extractor(lines)
+
     symbols: list[CodeSymbol] = []
-    for name, kind, start, end, signature in extractor(lines):
+    for name, kind, start, end, signature in raw:
         block_lines = lines[start - 1: min(end, start - 1 + MAX_SYMBOL_LINES)]
         block = "\n".join(block_lines)
         if len(block) > MAX_SYMBOL_CHARS:
@@ -396,7 +386,6 @@ def extract_symbols_from_file(relative_path: str, content: str) -> list[CodeSymb
 
 
 def build_symbols_from_project(root: Path, progress_callback=None) -> tuple[list[CodeSymbol], int]:
-    """Сканирует проект и превращает файлы в список CodeSymbol."""
     files = collect_source_files(root)
     all_symbols: list[CodeSymbol] = []
 
@@ -411,19 +400,9 @@ def build_symbols_from_project(root: Path, progress_callback=None) -> tuple[list
     return all_symbols, len(files)
 
 
-# ============================================================================
-# Шаг 3: токенизация для BM25
-# ============================================================================
-
 def tokenize_for_bm25(text: str) -> list[str]:
-    """
-    Разбивает текст на токены для лексического поиска. Составные
-    идентификаторы (camelCase, PascalCase, snake_case, kebab-case)
-    дополнительно дробятся на смысловые части — это сильно повышает
-    шанс совпадения, когда вопрос использует слово "переименование",
-    а в коде идентификатор называется, например, "renameCard" или
-    "rename-card".
-    """
+    # разбиваем ещё и camelCase/snake_case на части - без этого bm25
+    # не находит "handleClick" по запросу "click"
     raw_tokens = re.findall(r"[A-Za-zА-Яа-яЁё0-9]+", text)
     tokens: list[str] = []
     for tok in raw_tokens:
@@ -434,42 +413,21 @@ def tokenize_for_bm25(text: str) -> list[str]:
     return tokens
 
 
-# ============================================================================
-# Шаг 4: гибридный индекс символов (BM25 + эмбеддинги) и слияние через RRF
-# ============================================================================
-
 @st.cache_resource(show_spinner="Загрузка модели эмбеддингов...")
 def load_embedding_model(model_name: str = EMBEDDING_MODEL_NAME) -> SentenceTransformer:
-    """Кешируется на уровне процесса Streamlit — не перезагружается между поисками."""
     return SentenceTransformer(model_name)
 
 
 class HybridSymbolIndex:
-    """
-    Объединяет лексический поиск (BM25) и семантический (эмбеддинги +
-    ChromaDB) ПО СИМВОЛАМ (функции/методы/классы/обработчики/роуты/стили),
-    а не по произвольным кускам текста. Результаты сливаются через
-    Reciprocal Rank Fusion — каждый символ получает суммарный ранг по
-    обоим спискам, сортировка по нему даёт финальный порядок кандидатов.
-
-    Почему не один из двух: BM25 отлично ловит точные совпадения имён
-    (handleClick, onCardRename), но ничего не знает о синонимах и
-    перефразировках. Эмбеддинги — наоборот, хороши в перефразировках
-    ("переименование карточки" → "renameCard"), но могут "размыть"
-    точное совпадение редкого имени среди похожих по структуре символов.
-    Вместе они компенсируют слабости друг друга.
-    """
 
     def __init__(self, symbols: list[CodeSymbol], embedding_model: SentenceTransformer):
         self.symbols = symbols
         self.embedding_model = embedding_model
         self.id_to_symbol = {s.id: s for s in symbols}
 
-        # --- Лексический индекс (BM25) ---
         tokenized_corpus = [tokenize_for_bm25(s.searchable_text) for s in symbols]
         self.bm25 = BM25Okapi(tokenized_corpus) if tokenized_corpus else None
 
-        # --- Семантический индекс (ChromaDB, in-memory) ---
         self.chroma_client = chromadb.Client()
         self.collection = self.chroma_client.get_or_create_collection(
             name=f"code_symbols_{uuid.uuid4().hex[:8]}",
@@ -485,23 +443,21 @@ class HybridSymbolIndex:
             )
 
     def search(self, query: str, top_k: int) -> list[CodeSymbol]:
-        """Возвращает top_k символов, отранжированных гибридным поиском (RRF)."""
         if not self.symbols or self.bm25 is None:
             return []
 
+        # берём пул побольше top_k с обеих сторон (bm25 и эмбеддинги),
+        # а потом сливаем через RRF - так честнее, чем resorting по одному скору
         pool_size = min(CANDIDATE_POOL_SIZE, len(self.symbols))
 
-        # --- Кандидаты по BM25 ---
         bm25_scores = self.bm25.get_scores(tokenize_for_bm25(query))
         bm25_ranked_idx = sorted(range(len(self.symbols)), key=lambda i: bm25_scores[i], reverse=True)[:pool_size]
         bm25_ranked_ids = [self.symbols[i].id for i in bm25_ranked_idx]
 
-        # --- Кандидаты по эмбеддингам ---
         query_embedding = self.embedding_model.encode([query], convert_to_numpy=True)
         semantic_result = self.collection.query(query_embeddings=query_embedding.tolist(), n_results=pool_size)
         semantic_ranked_ids = semantic_result.get("ids", [[]])[0]
 
-        # --- Reciprocal Rank Fusion: суммируем 1/(RRF_K + ранг) по обоим спискам ---
         rrf_scores: dict[str, float] = {}
         for rank, symbol_id in enumerate(bm25_ranked_ids, start=1):
             rrf_scores[symbol_id] = rrf_scores.get(symbol_id, 0.0) + 1.0 / (RRF_K + rank)
@@ -512,12 +468,7 @@ class HybridSymbolIndex:
         return [self.id_to_symbol[sid] for sid in best_ids if sid in self.id_to_symbol]
 
 
-# ============================================================================
-# Шаг 5: один batched-запрос к Ollama — подтвердить и объяснить находку
-# ============================================================================
-
 def is_ollama_available() -> bool:
-    """Быстрая проверка, что локальный сервер Ollama поднят."""
     try:
         requests.get(OLLAMA_BASE_URL, timeout=2)
         return True
@@ -526,7 +477,6 @@ def is_ollama_available() -> bool:
 
 
 def list_ollama_models() -> list[str]:
-    """Модели, реально скачанные пользователем (`ollama pull ...`)."""
     try:
         response = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=3)
         response.raise_for_status()
@@ -536,7 +486,6 @@ def list_ollama_models() -> list[str]:
 
 
 def pick_default_model(available_models: list[str]) -> int:
-    """Индекс модели, заточенной под код, если такая уже скачана — иначе 0."""
     for preferred in PREFERRED_MODELS:
         if preferred in available_models:
             return available_models.index(preferred)
@@ -544,9 +493,6 @@ def pick_default_model(available_models: list[str]) -> int:
 
 
 def _extract_json_snippet(text: str) -> str:
-    """Вырезает JSON-массив из текста ответа модели: даже с "format": "json"
-    некоторые модели добавляют лишний текст вокруг — берём подстроку от
-    первой '[' до последней ']'."""
     start, end = text.find("["), text.rfind("]")
     if start != -1 and end != -1 and end > start:
         return text[start:end + 1]
@@ -554,9 +500,6 @@ def _extract_json_snippet(text: str) -> str:
 
 
 def _coerce_to_analysis_list(parsed: object) -> list[dict] | None:
-    """Приводит разобранный JSON к списку словарей независимо от формы,
-    в которую его завернула модель (голый массив / {"results": [...]} /
-    словарь с номерами-ключами)."""
     if isinstance(parsed, list):
         return parsed
     if isinstance(parsed, dict):
@@ -574,8 +517,6 @@ def _coerce_to_analysis_list(parsed: object) -> list[dict] | None:
 
 
 def analyze_candidates_with_ollama_plain(question: str, candidates: list[CodeSymbol], model: str) -> list[dict]:
-    """Запасной способ — БЕЗ принудительного JSON, построчным текстом вида
-    "N: описание". Используется, если строгий JSON-режим не сработал."""
     numbered_blocks = [f"[{i}] ({c.kind}) {c.name} — {c.location}" for i, c in enumerate(candidates, start=1)]
     context_text = "\n".join(numbered_blocks)
     user_message = (
@@ -626,17 +567,6 @@ def analyze_candidates_with_ollama_plain(question: str, candidates: list[CodeSym
 
 
 def analyze_candidates_with_ollama(question: str, candidates: list[CodeSymbol], model: str) -> list[dict]:
-    """
-    ОДИН запрос к Ollama на весь набор кандидатов: модель получает вопрос и
-    все найденные символы сразу, пронумерованные, и должна вернуть строгий
-    JSON-массив — для каждого номера: релевантен ли он, насколько уверенно
-    (0-100) и краткое объяснение. Путь к файлу и номера строк в финальном
-    выводе ВСЕГДА берутся из Python-данных по номеру кандидата, а не из
-    текста модели — модель не может ошибиться в локации, она только
-    выбирает лучший вариант среди уже гарантированно верных кандидатов.
-
-    Возвращает список {"index": int, "relevant": bool, "score": int, "reason": str}.
-    """
     if not candidates:
         return []
 
@@ -658,6 +588,17 @@ def analyze_candidates_with_ollama(question: str, candidates: list[CodeSymbol], 
         "Будь щедрым, но честным: если кандидат задействует ту же сущность "
         "(то же имя функции/переменной/id/класса/маршрута), что и в вопросе, "
         "или явно реализует описанное поведение — считай его релевантным.\n\n"
+        "Когда вопрос звучит как 'где обработчик X' без уточнений, скорее "
+        "всего имеется в виду именно ТОЧКА ВХОДА — то, что напрямую "
+        "привязано к событию или запросу (route, addEventListener, "
+        "onClick и т.п.), а не внутренняя функция/метод, которую эта точка "
+        "входа вызывает. Такой точке входа давай оценку ВЫШЕ, чем "
+        "вспомогательным функциям, которые она вызывает внутри себя, даже "
+        "если оба варианта релевантны.\n\n"
+        "Не округляй оценки до одних и тех же 'красивых' чисел (70, 80, 90) "
+        "для разных кандидатов — если один вариант точнее отвечает на "
+        "вопрос, чем другой, это ДОЛЖНО отражаться в разнице баллов, даже "
+        "если оба релевантны.\n\n"
         "Ответь СТРОГО в виде JSON-массива и ничего, кроме него — без "
         "вступлений, пояснений и markdown-разметки. По одному объекту на "
         "каждый номер кандидата, в точности в этом формате:\n"
@@ -713,17 +654,9 @@ def analyze_candidates_with_ollama(question: str, candidates: list[CodeSymbol], 
     return analysis_list
 
 
-# ============================================================================
-# Вспомогательные функции интерфейса
-# ============================================================================
-
 def pick_folder_native() -> str | None:
-    """
-    Открывает системное окно выбора папки через AppleScript, запущенный
-    ОТДЕЛЬНЫМ процессом (Streamlit выполняет код в фоновом потоке, а GUI-
-    диалоги на macOS обязаны работать в главном потоке). Поддерживается
-    только на macOS.
-    """
+    # системный диалог выбора папки есть только на macOS,
+    # для винды/линукса пока просто не показываем кнопку
     if sys.platform != "darwin":
         return None
 
@@ -736,30 +669,15 @@ def pick_folder_native() -> str | None:
             return None
         return result.stdout.strip() or None
     except Exception:
+        # пользователь мог просто нажать "отмена" в диалоге - это не ошибка
         return None
-
-
-KIND_ICONS = {
-    "function": "🔧", "method": "🔧", "class": "🏛️", "route": "🌐",
-    "listener": "🎯", "handler-ref": "🎯", "inline-handler": "🎯",
-    "style": "🎨",
-}
-
-
-def kind_icon(kind: str) -> str:
-    for prefix, icon in KIND_ICONS.items():
-        if kind.startswith(prefix):
-            return icon
-    return "📍"
 
 
 def render_symbol_line(symbol: CodeSymbol, rank: int | None = None, reason: str | None = None,
                         score: int | None = None, highlight: bool = False) -> None:
-    """Компактная строка с локацией найденного символа."""
-    prefix = f"**#{rank}**  " if rank is not None else ""
-    icon = kind_icon(symbol.kind)
-    score_badge = f"  · уверенность {score}%" if score is not None else ""
-    line = f"{prefix}{icon} **{symbol.name}** ({symbol.kind}) — `{symbol.location}`{score_badge}"
+    prefix = f"#{rank}  " if rank is not None else ""
+    score_badge = f"  (уверенность {score}%)" if score is not None else ""
+    line = f"{prefix}**{symbol.name}** ({symbol.kind}) — `{symbol.location}`{score_badge}"
     if highlight:
         st.success(line)
     else:
@@ -772,7 +690,6 @@ def render_symbol_line(symbol: CodeSymbol, rank: int | None = None, reason: str 
 
 
 def render_sidebar() -> tuple[bool, bool, str, int]:
-    """Отрисовывает боковую панель и возвращает (index_button, use_generation, ollama_model, top_k)."""
     with st.sidebar:
         st.header("1. Индексация проекта")
 
@@ -792,16 +709,16 @@ def render_sidebar() -> tuple[bool, bool, str, int]:
             )
         with browse_col:
             st.write("")
-            st.button("📂", help="Выбрать папку через системный диалог", on_click=_handle_browse_click)
+            st.button("...", help="Выбрать папку через системный диалог", on_click=_handle_browse_click)
 
-        index_button = st.button("📚 Проиндексировать", use_container_width=True)
+        index_button = st.button("Проиндексировать", use_container_width=True)
 
         if st.session_state.index is not None:
             st.info(
                 f"**Текущий индекс:**\n\n"
-                f"📁 `{st.session_state.indexed_project}`\n\n"
-                f"📄 файлов: {st.session_state.file_count}  \n"
-                f"🧩 символов: {st.session_state.symbol_count}"
+                f"`{st.session_state.indexed_project}`\n\n"
+                f"файлов: {st.session_state.file_count}  \n"
+                f"символов: {st.session_state.symbol_count}"
             )
 
         st.divider()
@@ -848,7 +765,6 @@ def render_sidebar() -> tuple[bool, bool, str, int]:
 
 
 def handle_indexing(project_path: str) -> None:
-    """Обрабатывает нажатие кнопки «Проиндексировать»."""
     root = Path(project_path).expanduser().resolve()
     if not project_path:
         st.error("Укажите путь к проекту.")
@@ -887,7 +803,6 @@ def handle_indexing(project_path: str) -> None:
 
 
 def handle_search(question: str, ollama_model: str, use_generation: bool, ollama_ready: bool, top_k: int) -> None:
-    """Обрабатывает нажатие кнопки «Найти»: гибридный поиск + (опционально) подтверждение через LLM."""
     with st.spinner("Ищу подходящие символы (BM25 + эмбеддинги)..."):
         try:
             candidates = st.session_state.index.search(question, top_k=top_k)
@@ -900,7 +815,7 @@ def handle_search(question: str, ollama_model: str, use_generation: bool, ollama
         return
 
     if not (use_generation and ollama_ready):
-        st.subheader(f"📍 Найдено кандидатов: {len(candidates)}")
+        st.subheader(f"Найдено кандидатов: {len(candidates)}")
         st.caption("Включите подтверждение через LLM в боковой панели для проверки и объяснения.")
         for rank, symbol in enumerate(candidates, start=1):
             render_symbol_line(symbol, rank=rank, highlight=(rank == 1))
@@ -910,13 +825,11 @@ def handle_search(question: str, ollama_model: str, use_generation: bool, ollama
         try:
             analysis = analyze_candidates_with_ollama(question, candidates, ollama_model)
         except AnalysisError as exc_json:
-            # Строгий JSON-режим не сработал — пробуем запасной вариант
-            # обычным текстом, прежде чем совсем сдаться.
             try:
                 analysis = analyze_candidates_with_ollama_plain(question, candidates, ollama_model)
             except AnalysisError as exc_plain:
                 st.error(
-                    f"⚠️ Не удалось получить ответ от Ollama.\n\n"
+                    f"Не удалось получить ответ от Ollama.\n\n"
                     f"JSON-режим: {exc_json}\n\nТекстовый режим: {exc_plain}\n\n"
                     f"Частая причина — модель ещё не скачана: `ollama pull {ollama_model}`."
                 )
@@ -926,7 +839,7 @@ def handle_search(question: str, ollama_model: str, use_generation: bool, ollama
                     render_symbol_line(symbol, rank=rank)
                 return
 
-    relevant: list[tuple[CodeSymbol, int, str]] = []  # (symbol, score, reason)
+    relevant: list[tuple[CodeSymbol, int, str]] = []
     for item in analysis:
         idx = item.get("index")
         if not isinstance(idx, int) or not (1 <= idx <= len(candidates)):
@@ -940,12 +853,15 @@ def handle_search(question: str, ollama_model: str, use_generation: bool, ollama
         reason = str(item.get("reason", "")).strip()
         relevant.append((candidates[idx - 1], score, reason))
 
-    st.subheader(f"📍 Где находится обработчик — найдено релевантных: {len(relevant)}")
+    st.subheader(f"Где находится обработчик — найдено релевантных: {len(relevant)}")
     if relevant:
-        # Сортируем по уверенности модели; при равном score — по исходному
-        # рангу гибридного поиска (кто был выше в candidates, тот и раньше).
+        ENTRY_POINT_KINDS = {"route", "listener", "handler-ref", "inline-handler"}
         candidate_rank = {id(symbol): i for i, symbol in enumerate(candidates)}
-        relevant.sort(key=lambda t: (-t[1], candidate_rank.get(id(t[0]), 999)))
+        relevant.sort(key=lambda t: (
+            -t[1],
+            0 if t[0].kind in ENTRY_POINT_KINDS else 1,
+            candidate_rank.get(id(t[0]), 999),
+        ))
 
         if len({score for _, score, _ in relevant}) == 1 and len(relevant) > 1:
             st.caption(
@@ -970,13 +886,11 @@ def handle_search(question: str, ollama_model: str, use_generation: bool, ollama
 
     with st.expander("🔍 Показать всех кандидатов и код целиком"):
         for rank, symbol in enumerate(candidates, start=1):
-            st.markdown(f"**#{rank}** {kind_icon(symbol.kind)} `{symbol.location}` — {symbol.name} ({symbol.kind})")
+            st.markdown(f"#{rank} `{symbol.location}` — {symbol.name} ({symbol.kind})")
             st.code(symbol.text, language=None)
 
 
 def handle_browse(filter_text: str) -> None:
-    """Вкладка «Все определения»: просто список всех найденных символов,
-    без вопроса и без LLM — как облегчённый ctags/symbol table."""
     symbols: list[CodeSymbol] = st.session_state.index.symbols
     if filter_text.strip():
         needle = filter_text.strip().lower()
@@ -988,10 +902,6 @@ def handle_browse(filter_text: str) -> None:
     if len(symbols) > 300:
         st.caption(f"…и ещё {len(symbols) - 300}. Уточните фильтр.")
 
-
-# ============================================================================
-# Точка входа
-# ============================================================================
 
 def main() -> None:
     st.set_page_config(page_title="Handler Locator", page_icon="📍", layout="wide")
@@ -1013,10 +923,10 @@ def main() -> None:
         handle_indexing(st.session_state["project_path_input"])
 
     if st.session_state.index is None:
-        st.info("👈 Сначала укажите путь к проекту и нажмите «Проиндексировать» в боковой панели.")
+        st.info("Сначала укажите путь к проекту и нажмите «Проиндексировать» в боковой панели.")
         return
 
-    tab_search, tab_browse = st.tabs(["🔎 Найти обработчик", "🗂 Все определения"])
+    tab_search, tab_browse = st.tabs(["Найти обработчик", "Все определения"])
 
     with tab_search:
         question = st.text_input(
@@ -1031,7 +941,7 @@ def main() -> None:
             st.warning("Введите вопрос.")
 
     with tab_browse:
-        filter_text = st.text_input("Фильтр по имени или пути файла", key="browse_filter")
+        filter_text = st.text_input("Фильтр по имени/пути файла", key="browse_filter")
         handle_browse(filter_text)
 
 
